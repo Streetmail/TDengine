@@ -184,13 +184,11 @@ int main(int argc, char* argv[]) {
     // conn mode
     if (setConnMode(g_arguments->connMode, g_arguments->dsn, true) != 0) {
         exitLog();
-        return -1;
+        return -1;be
     }
 
     // check condition for set config dir
-    if (strlen(g_configDir)
-            && g_arguments->host_auto
-            && g_arguments->port_auto) {
+    if (strlen(g_configDir)) {
         // apply
         if(applyConfigDir(g_configDir) != TSDB_CODE_SUCCESS) {
             exitLog();
