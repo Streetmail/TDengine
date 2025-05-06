@@ -18,6 +18,7 @@
 #define TDB_BTREE_ROOT 0x1
 #define TDB_BTREE_LEAF 0x2
 #define TDB_BTREE_OVFL 0x4
+#define TDB_BTREE_STACK 0x8  // this is a stack (for free page management)
 
 struct SBTree {
   SPgno         root;
@@ -42,6 +43,7 @@ struct SBTree {
 #define TDB_BTREE_PAGE_IS_ROOT(PAGE)          (TDB_BTREE_PAGE_GET_FLAGS(PAGE) & TDB_BTREE_ROOT)
 #define TDB_BTREE_PAGE_IS_LEAF(PAGE)          (TDB_BTREE_PAGE_GET_FLAGS(PAGE) & TDB_BTREE_LEAF)
 #define TDB_BTREE_PAGE_IS_OVFL(PAGE)          (TDB_BTREE_PAGE_GET_FLAGS(PAGE) & TDB_BTREE_OVFL)
+#define TDB_BTREE_PAGE_IS_STACK(PAGE)          (TDB_BTREE_PAGE_GET_FLAGS(PAGE) & TDB_BTREE_STACK)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -389,8 +391,131 @@ int tdbBtreePGet(SBTree *pBt, const void *pKey, int kLen, void **ppKey, int *pkL
   return 0;
 }
 
-// push & pop are only for free page management, they are using the b-tree as a stack.
-// never call them for other purpose
+// tdbBtreeToStack, tdbBtreePushFreePage, tdbBtreePopFreePage are only for free page management,
+// they are using the b-tree as a stack, never call them for other purpose
+static int btreeToStack(SBTree* pBt, TXN* pTxn) {
+  SPage *pRoot = NULL;
+  SBtreeInitPageArg arg = {.pBt = pBt, .flags = TDB_BTREE_ROOT | TDB_BTREE_LEAF};
+  int ret = tdbPagerFetchPage(pBt->pPager, &pBt->root, &pRoot, tdbBtreeInitPage, &arg, pTxn);
+  if (ret < 0) {
+    tdbError("tdb/btree-to-stack: fetch root page failed with ret: %d.", ret);
+    return ret;
+  }
+
+  // already a stack
+  if (TDB_BTREE_PAGE_IS_STACK(pRoot)) {
+    tdbPagerReturnPage(pBt->pPager, pRoot, pTxn);
+    return 0;
+  }
+
+  // mark dirty
+  ret = tdbPagerWrite(pBt->pPager, pRoot);
+  if (ret < 0) {
+    tdbError("tdb/btree-to-stack: failed to mark root page dirty since %s", terrstr());
+    tdbPagerReturnPage(pBt->pPager, pRoot, pTxn);
+    return ret;
+  }
+
+  int szCell = sizeof(SPgno);
+  // if the root page is leaf and still have enough space for a new cell.
+  if (TDB_BTREE_PAGE_IS_LEAF(pRoot) && TDB_PAGE_FREE_SIZE(pRoot) >= szCell + TDB_PAGE_OFFSET_SIZE(pRoot)) {
+    // mark the root page as free page management page, then upgrade is complete.
+    TDB_BTREE_PAGE_SET_FLAGS(pRoot, TDB_BTREE_STACK);
+    tdbPagerReturnPage(pBt->pPager, pRoot, pTxn);
+    return 0;
+  }
+
+  SArray *pgnos = taosArrayInit(2048, sizeof(SPgno));
+  if (pgnos == NULL) {
+    tdbPagerReturnPage(pBt->pPager, pRoot, pTxn);
+    tdbError("tdb/btree-to-stack: taosArrayInit failed.");
+    return terrno;
+  }
+
+  // traverse the b-tree to get all page numbers of the free pages.
+  // BUG: except the root page, all other pages of the b-tree become free pages after
+  //      the conversion, but they are lost.
+  SBTC btc;
+  ret = tdbBtcOpen(&btc, pBt, pTxn);
+  if (ret) {
+    tdbError("tdb/btree-to-stack: btc open failed with ret: %d.", ret);
+    return ret;
+  }
+
+  ret = tdbBtcMoveToFirst(&btc);
+  if (ret < 0) {
+    tdbError("tdb/btree-to-stack: btc move to first failed with ret: %d.", ret);
+    tdbPagerReturnPage(pBt->pPager, pRoot, pTxn);
+    taosArrayDestroy(pgnos);
+    tdbBtcClose(&btc);
+    return ret;
+  }
+
+  void* pKey = NULL;
+  while( 1 ) {
+    int kLen = 0;
+    ret = tdbBtreeNext(&btc, &pKey, &kLen, NULL, NULL);
+    if (ret < 0) {
+      break;
+    }
+
+    if (kLen != sizeof(SPgno)) {
+      tdbError("tdb/btree-to-stack: key length is not %d, but %d.", sizeof(SPgno), kLen);
+      break;
+    }
+
+    taosArrayPush(pgnos, pKey);
+  }
+  tdbFree(pKey);
+  tdbBtcClose(&btc);
+
+  // re-initialize the root page
+  tdbBtreeInitPage(pRoot, &arg, 0);
+
+  for (int i = 0; i < taosArrayGetSize(pgnos); i++) {
+    SPgno pgno = *(SPgno*)taosArrayGet(pgnos, i);
+    SPage *pPage = NULL;
+    ret = tdbPagerFetchPage(pBt->pPager, &pgno, &pPage, tdbBtreeInitPage, &arg, pTxn);
+    if (ret < 0) {
+      tdbError("tdb/btree-to-stack: fetch page %d failed with ret: %d.", pgno, ret);
+      taosArrayDestroy(pgnos);
+      tdbPagerReturnPage(pBt->pPager, pRoot, pTxn);
+      return ret;
+    }
+
+    tdbBtreePushFreePage(pBt, pPage, pTxn);
+  }
+
+  taosArrayDestroy(pgnos);
+
+  // mark the root page as free page management page, then upgrade is complete.
+  TDB_BTREE_PAGE_SET_FLAGS(pRoot, TDB_BTREE_STACK);
+  tdbPagerReturnPage(pBt->pPager, pRoot, pTxn);
+  return 0;
+}
+
+int tdbBtreeToStack(SBTree *pBt) {
+  TDB* pEnv = pBt->pPager->pEnv;
+  TXN* pTxn = NULL;
+
+  int ret = tdbBegin(pEnv, &pTxn, tdbDefaultMalloc, tdbDefaultFree, NULL, TDB_TXN_WRITE | TDB_TXN_READ_UNCOMMITTED);
+  if (ret < 0) {
+    return ret;
+  }
+
+
+  ret = btreeToStack(pBt, pTxn);
+  if (ret < 0) {
+    tdbAbort(pEnv, pTxn);
+    return ret;
+  }
+
+  ret = tdbCommit(pEnv, pTxn);
+  if (ret) return ret;
+
+  return tdbPostCommit(pEnv, pTxn);
+}
+
 int tdbBtreePushFreePage(SBTree *pBt, SPage *pPage, TXN* pTxn) {
   // always insert at the beginning of root page
   SPage *pRoot = NULL;
