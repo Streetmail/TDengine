@@ -555,6 +555,11 @@ static int32_t queryConvertTableMetaMsg(STableMetaRsp *pMetaMsg) {
     return TSDB_CODE_TSC_INVALID_VALUE;
   }
 
+  if (pMetaMsg->rversion < 0) {
+    qError("invalid rversion[%d] in table meta rsp msg", pMetaMsg->rversion);
+    return TSDB_CODE_TSC_INVALID_VALUE;
+  }
+
   if (pMetaMsg->pSchemas[0].colId != PRIMARYKEY_TIMESTAMP_COL_ID) {
     qError("invalid colId[%" PRIi16 "] for the first column in table meta rsp msg", pMetaMsg->pSchemas[0].colId);
     return TSDB_CODE_TSC_INVALID_VALUE;
@@ -595,6 +600,7 @@ int32_t queryCreateVCTableMetaFromMsg(STableMetaRsp *msg, SVCTableMeta **pMeta) 
   pTableMeta->uid = msg->tuid;
   pTableMeta->suid = msg->suid;
   pTableMeta->numOfColRefs = msg->numOfColRefs;
+  pTableMeta->rversion = msg->rversion;
 
   pTableMeta->colRef = (SColRef *)((char *)pTableMeta + sizeof(SVCTableMeta));
   memcpy(pTableMeta->colRef, msg->pColRefs, pColRefSize);
@@ -628,6 +634,7 @@ int32_t queryCreateTableMetaFromMsg(STableMetaRsp *msg, bool isStb, STableMeta *
   pTableMeta->suid = msg->suid;
   pTableMeta->sversion = msg->sversion;
   pTableMeta->tversion = msg->tversion;
+  pTableMeta->rversion = msg->rversion;
   pTableMeta->virtualStb = msg->virtualStb;
   pTableMeta->numOfColRefs = msg->numOfColRefs;
 
@@ -696,6 +703,7 @@ int32_t queryCreateTableMetaExFromMsg(STableMetaRsp *msg, bool isStb, STableMeta
   pTableMeta->suid = msg->suid;
   pTableMeta->sversion = msg->sversion;
   pTableMeta->tversion = msg->tversion;
+  pTableMeta->rversion = msg->rversion;
   pTableMeta->virtualStb = msg->virtualStb;
   pTableMeta->numOfColRefs = msg->numOfColRefs;
 
