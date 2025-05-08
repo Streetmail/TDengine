@@ -576,7 +576,7 @@ int32_t ctgCopyTbMeta(SCatalog *pCtg, SCtgTbMetaCtx *ctx, SCtgDBCache **pDb, SCt
   int32_t metaSize = sizeof(SCTableMeta);
   int32_t colRefSize = 0;
   int32_t numOfColRefs = 0;
-  int32_t rversion = tbMeta->rversion;;
+  int32_t rversion = hasRefCol(tbMeta->tableType) ? tbMeta->rversion : 1;
   SColRef *tmpRef = NULL;
 
   if (hasRefCol(tbMeta->tableType) && tbMeta->colRef != NULL) {
@@ -706,7 +706,7 @@ int32_t ctgReadTbVerFromCache(SCatalog *pCtg, SName *pTableName, int32_t *sver, 
   STableMeta *tbMeta = tbCache->pMeta;
   *tbType = tbMeta->tableType;
   *suid = tbMeta->suid;
-  *rver = tbMeta->rversion;
+  *rver = hasRefCol(*tbType) ? tbMeta->rversion : 1;
 
   if (*tbType != TSDB_CHILD_TABLE && *tbType != TSDB_VIRTUAL_CHILD_TABLE) {
     *sver = tbMeta->sversion;
@@ -3648,7 +3648,7 @@ int32_t ctgGetTbMetasFromCache(SCatalog *pCtg, SRequestConnInfo *pConn, SCtgTbMe
 
     int32_t metaSize = sizeof(SCTableMeta);
     int32_t colRefSize = 0;
-    int32_t rversion = tbMeta->rversion;
+    int32_t rversion = hasRefCol(tbMeta->tableType) ? tbMeta->rversion : 1;
     int32_t colRefNum = 0;
 
     pTableMeta = taosMemoryCalloc(1, metaSize);
